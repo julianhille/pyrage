@@ -1,8 +1,8 @@
 #![deny(unsafe_code)]
 
 use std::collections::HashSet;
-use std::io::Write;
-use std::{fs::File, io::Read};
+use std::fs::File;
+use std::io::{self, Read, Write};
 
 use age::{
     armor::ArmoredReader, armor::ArmoredWriter, armor::Format, DecryptError as RageDecryptError,
@@ -38,7 +38,7 @@ create_exception!(pyrage, IdentityError, PyException);
 //
 // `Send` is required so that recipients can be moved across a GIL release.
 trait PyrageRecipient: Recipient + Send {
-    fn as_recipient(self: Box<Self>) -> Box<dyn Recipient>;
+    fn as_recipient(self: Box<Self>) -> Box<dyn Recipient + Send>;
 }
 
 // This is a wrapper trait for age's `Identity`, providing trait downcasting.
@@ -65,8 +65,8 @@ macro_rules! recipient_traits {
             }
 
             impl PyrageRecipient for $t {
-                fn as_recipient(self: Box<Self>) -> Box<dyn Recipient> {
-                    self as Box<dyn Recipient + Send>
+                fn as_recipient(self: Box<Self>) -> Box<dyn Recipient + Send> {
+                    self
                 }
             }
         )*
@@ -156,6 +156,103 @@ impl<'py> FromPyObject<'_, 'py> for Box<dyn PyrageIdentity> {
 
 create_exception!(pyrage, EncryptError, PyException);
 
+// Buffer size for streaming I/O. This matches age's STREAM chunk size, and
+// for Python file-likes it bounds how often we have to re-acquire the GIL.
+const IO_BUF_SIZE: usize = 64 * 1024;
+
+// Converts an I/O error from a streaming operation into a Python error.
+//
+// Errors raised by a Python file-like are passed through unchanged, so the
+// caller sees their own exception, and OS errors become the matching
+// `OSError` (as for opening a file); everything else (age's own stream
+// errors, e.g. truncated or corrupt input) is wrapped in the given type.
+fn io_error(e: io::Error, wrap: impl FnOnce(String) -> PyErr) -> PyErr {
+    if e.raw_os_error().is_some() || e.get_ref().is_some_and(|inner| inner.is::<PyErr>()) {
+        PyErr::from(e)
+    } else {
+        wrap(e.to_string())
+    }
+}
+
+// Same as `io_error`, for age's error types: their `Io` variants may carry a
+// Python exception from a file-like, which we unwrap rather than stringify.
+fn encrypt_error(e: RageEncryptError) -> PyErr {
+    match e {
+        RageEncryptError::Io(e) => io_error(e, EncryptError::new_err),
+        e => EncryptError::new_err(e.to_string()),
+    }
+}
+
+fn decrypt_error(e: RageDecryptError) -> PyErr {
+    match e {
+        RageDecryptError::Io(e) => io_error(e, DecryptError::new_err),
+        e => DecryptError::new_err(e.to_string()),
+    }
+}
+
+// Builds an `Encryptor` for pyrage's recipient types. Wrapping the file key
+// can be slow (plugins run external binaries), so call this without the GIL.
+fn recipients_encryptor(recipients: Vec<Box<dyn PyrageRecipient>>) -> PyResult<Encryptor> {
+    // This turns each `dyn PyrageRecipient` into a `dyn Recipient`, which
+    // is what the underlying `age` API expects.
+    let recipients = recipients
+        .into_iter()
+        .map(|pr| pr.as_recipient())
+        .collect::<Vec<_>>();
+
+    Encryptor::with_recipients(recipients.iter().map(|r| r.as_ref() as _)).map_err(encrypt_error)
+}
+
+// Encrypts everything from `reader` into `writer`. This is pure Rust and
+// does not touch the GIL, so callers run it inside `Python::detach`.
+pub(crate) fn encrypt_stream<R: Read, W: Write>(
+    mut reader: R,
+    writer: W,
+    encryptor: Encryptor,
+    armored: bool,
+) -> PyResult<W> {
+    let format = match armored {
+        true => Format::AsciiArmor,
+        false => Format::Binary,
+    };
+    let armored_writer = ArmoredWriter::wrap_output(writer, format)
+        .map_err(|e| io_error(e, EncryptError::new_err))?;
+    let mut writer = encryptor
+        .wrap_output(armored_writer)
+        .map_err(|e| io_error(e, EncryptError::new_err))?;
+
+    io::copy(&mut reader, &mut writer).map_err(|e| io_error(e, EncryptError::new_err))?;
+
+    let writer = writer
+        .finish()
+        .map_err(|e| io_error(e, EncryptError::new_err))?
+        .finish()
+        .map_err(|e| io_error(e, EncryptError::new_err))?;
+
+    Ok(writer)
+}
+
+fn as_identities(identities: &[Box<dyn PyrageIdentity>]) -> impl Iterator<Item = &dyn Identity> {
+    identities.iter().map(|pi| pi.as_ref().as_identity())
+}
+
+// Decrypts everything from `reader` into `writer`. Like `encrypt_stream`,
+// this is meant to run without the GIL held.
+pub(crate) fn decrypt_stream<'a, R: io::BufRead, W: Write>(
+    reader: R,
+    writer: &mut W,
+    identities: impl Iterator<Item = &'a dyn Identity>,
+) -> PyResult<()> {
+    let decryptor =
+        age::Decryptor::new_buffered(ArmoredReader::new(reader)).map_err(decrypt_error)?;
+
+    let mut reader = decryptor.decrypt(identities).map_err(decrypt_error)?;
+
+    io::copy(&mut reader, writer).map_err(|e| io_error(e, DecryptError::new_err))?;
+
+    Ok(())
+}
+
 #[pyfunction]
 #[pyo3(signature = (plaintext, recipients, armored=false))]
 fn encrypt<'p>(
@@ -165,39 +262,12 @@ fn encrypt<'p>(
     armored: bool,
 ) -> PyResult<Bound<'p, PyBytes>> {
     let encrypted = py.detach(|| {
-        // This turns each `dyn PyrageRecipient` into a `dyn Recipient`, which
-        // is what the underlying `age` API expects.
-        let recipients = recipients
-            .into_iter()
-            .map(|pr| pr.as_recipient())
-            .collect::<Vec<_>>();
-
-        let encryptor = Encryptor::with_recipients(recipients.iter().map(|r| r.as_ref()))
-            .map_err(|e| EncryptError::new_err(e.to_string()))?;
-        let mut encrypted = vec![];
-
-        let mut writer = match armored {
-            true => encryptor
-                .wrap_output(ArmoredWriter::wrap_output(
-                    &mut encrypted,
-                    Format::AsciiArmor,
-                )?)
-                .map_err(|e| EncryptError::new_err(e.to_string()))?,
-            false => encryptor
-                .wrap_output(ArmoredWriter::wrap_output(&mut encrypted, Format::Binary)?)
-                .map_err(|e| EncryptError::new_err(e.to_string()))?,
-        };
-
-        writer
-            .write_all(plaintext)
-            .map_err(|e| EncryptError::new_err(e.to_string()))?;
-        writer
-            .finish()
-            .map_err(|e| EncryptError::new_err(e.to_string()))?
-            .finish()
-            .map_err(|e| EncryptError::new_err(e.to_string()))?;
-
-        PyResult::Ok(encrypted)
+        encrypt_stream(
+            plaintext,
+            vec![],
+            recipients_encryptor(recipients)?,
+            armored,
+        )
     })?;
 
     // TODO: Avoid this copy. Maybe PyBytes::new_with?
@@ -214,41 +284,15 @@ fn encrypt_file(
     armored: bool,
 ) -> PyResult<()> {
     py.detach(|| {
-        // This turns each `dyn PyrageRecipient` into a `dyn Recipient`, which
-        // is what the underlying `age` API expects.
-        let recipients = recipients
-            .into_iter()
-            .map(|pr| pr.as_recipient())
-            .collect::<Vec<_>>();
-
         let reader = File::open(infile)?;
         let writer = File::create(outfile)?;
 
-        let mut reader = std::io::BufReader::new(reader);
-        let mut writer = std::io::BufWriter::new(writer);
+        let reader = io::BufReader::with_capacity(IO_BUF_SIZE, reader);
+        let writer = io::BufWriter::with_capacity(IO_BUF_SIZE, writer);
 
-        let encryptor = Encryptor::with_recipients(recipients.iter().map(|r| r.as_ref()))
-            .map_err(|e| EncryptError::new_err(e.to_string()))?;
-
-        let mut writer = match armored {
-            true => encryptor
-                .wrap_output(ArmoredWriter::wrap_output(&mut writer, Format::AsciiArmor)?)
-                .map_err(|e| EncryptError::new_err(e.to_string()))?,
-            false => encryptor
-                .wrap_output(ArmoredWriter::wrap_output(&mut writer, Format::Binary)?)
-                .map_err(|e| EncryptError::new_err(e.to_string()))?,
-        };
-
-        std::io::copy(&mut reader, &mut writer)
-            .map_err(|e| EncryptError::new_err(e.to_string()))?;
-
-        writer
-            .finish()
-            .map_err(|e| EncryptError::new_err(e.to_string()))?
-            .finish()
-            .map_err(|e| EncryptError::new_err(e.to_string()))?;
-
-        Ok(())
+        encrypt_stream(reader, writer, recipients_encryptor(recipients)?, armored)?
+            .flush()
+            .map_err(|e| io_error(e, EncryptError::new_err))
     })
 }
 
@@ -261,19 +305,8 @@ fn decrypt<'p>(
     identities: Vec<Box<dyn PyrageIdentity>>,
 ) -> PyResult<Bound<'p, PyBytes>> {
     let decrypted = py.detach(move || {
-        let identities = identities.iter().map(|pi| pi.as_ref().as_identity());
-
-        let decryptor = age::Decryptor::new(ArmoredReader::new(ciphertext))
-            .map_err(|e| DecryptError::new_err(e.to_string()))?;
-
         let mut decrypted = vec![];
-        let mut reader = decryptor
-            .decrypt(identities)
-            .map_err(|e| DecryptError::new_err(e.to_string()))?;
-        reader
-            .read_to_end(&mut decrypted)
-            .map_err(|e| DecryptError::new_err(e.to_string()))?;
-
+        decrypt_stream(ciphertext, &mut decrypted, as_identities(&identities))?;
         PyResult::Ok(decrypted)
     })?;
 
@@ -289,24 +322,16 @@ fn decrypt_file(
     identities: Vec<Box<dyn PyrageIdentity>>,
 ) -> PyResult<()> {
     py.detach(move || {
-        let identities = identities.iter().map(|pi| pi.as_ref().as_identity());
-
         let reader = File::open(infile)?;
         let writer = File::create(outfile)?;
 
-        let reader = std::io::BufReader::new(reader);
-        let mut writer = std::io::BufWriter::new(writer);
+        let reader = io::BufReader::with_capacity(IO_BUF_SIZE, reader);
+        let mut writer = io::BufWriter::with_capacity(IO_BUF_SIZE, writer);
 
-        let decryptor = age::Decryptor::new_buffered(ArmoredReader::new(reader))
-            .map_err(|e| DecryptError::new_err(e.to_string()))?;
-
-        let mut reader = decryptor
-            .decrypt(identities)
-            .map_err(|e| DecryptError::new_err(e.to_string()))?;
-
-        std::io::copy(&mut reader, &mut writer)?;
-
-        Ok(())
+        decrypt_stream(reader, &mut writer, as_identities(&identities))?;
+        writer
+            .flush()
+            .map_err(|e| io_error(e, DecryptError::new_err))
     })
 }
 
@@ -328,41 +353,18 @@ fn encrypt_io(
 ) -> PyResult<()> {
     // The file-likes are created (and dropped) while holding the GIL; only
     // borrows of them cross into the detached section.
-    let reader = from_pyobject(reader, true)?;
-    let writer = from_pyobject(writer, false)?;
-    let mut reader = std::io::BufReader::new(reader);
-    let mut writer = std::io::BufWriter::new(writer);
+    let mut reader = io::BufReader::with_capacity(IO_BUF_SIZE, from_pyobject(reader, true)?);
+    let mut writer = io::BufWriter::with_capacity(IO_BUF_SIZE, from_pyobject(writer, false)?);
 
     py.detach(|| {
-        // This turns each `dyn PyrageRecipient` into a `dyn Recipient`, which
-        // is what the underlying `age` API expects.
-        let recipients = recipients
-            .into_iter()
-            .map(|pr| pr.as_recipient())
-            .collect::<Vec<_>>();
-
-        let encryptor = Encryptor::with_recipients(recipients.iter().map(|r| r.as_ref()))
-            .map_err(|e| EncryptError::new_err(e.to_string()))?;
-
-        let mut writer = match armored {
-            true => encryptor
-                .wrap_output(ArmoredWriter::wrap_output(&mut writer, Format::AsciiArmor)?)
-                .map_err(|e| EncryptError::new_err(e.to_string()))?,
-            false => encryptor
-                .wrap_output(ArmoredWriter::wrap_output(&mut writer, Format::Binary)?)
-                .map_err(|e| EncryptError::new_err(e.to_string()))?,
-        };
-
-        std::io::copy(&mut reader, &mut writer)
-            .map_err(|e| EncryptError::new_err(e.to_string()))?;
-
-        writer
-            .finish()
-            .map_err(|e| EncryptError::new_err(e.to_string()))?
-            .finish()
-            .map_err(|e| EncryptError::new_err(e.to_string()))?;
-
-        Ok(())
+        encrypt_stream(
+            &mut reader,
+            &mut writer,
+            recipients_encryptor(recipients)?,
+            armored,
+        )?
+        .flush()
+        .map_err(|e| io_error(e, EncryptError::new_err))
     })
 }
 
@@ -374,21 +376,17 @@ fn decrypt_io(
     identities: Vec<Box<dyn PyrageIdentity>>,
 ) -> PyResult<()> {
     // See `encrypt_io`: the file-likes never get dropped without the GIL.
-    let reader = from_pyobject(reader, true)?;
-    let writer = from_pyobject(writer, false)?;
-    let mut reader = std::io::BufReader::new(reader);
-    let mut writer = std::io::BufWriter::new(writer);
+    let mut reader = io::BufReader::with_capacity(IO_BUF_SIZE, from_pyobject(reader, true)?);
+    let mut writer = io::BufWriter::with_capacity(IO_BUF_SIZE, from_pyobject(writer, false)?);
+
     py.detach(|| {
         // Move the identities in (they're only `Send`); the file-likes stay
         // borrowed so they are dropped with the GIL held.
         let identities = identities;
-        let decryptor = age::Decryptor::new_buffered(ArmoredReader::new(&mut reader))
-            .map_err(|e| DecryptError::new_err(e.to_string()))?;
-        let mut reader = decryptor
-            .decrypt(identities.iter().map(|pi| pi.as_ref().as_identity()))
-            .map_err(|e| DecryptError::new_err(e.to_string()))?;
-        std::io::copy(&mut reader, &mut writer)?;
-        Ok(())
+        decrypt_stream(&mut reader, &mut writer, as_identities(&identities))?;
+        writer
+            .flush()
+            .map_err(|e| io_error(e, DecryptError::new_err))
     })
 }
 

@@ -104,6 +104,12 @@ class TestPluginRoundtrip(unittest.TestCase):
 
         self.assertEqual(2, len(callbacks.messages))
 
+    def test_missing_plugin(self):
+        with self.assertRaises(pyrage.EncryptError):
+            pyrage.plugin.RecipientPluginV1("does-not-exist", [], [], Callbacks())
+        with self.assertRaises(pyrage.DecryptError):
+            pyrage.plugin.IdentityPluginV1("does-not-exist", [], Callbacks())
+
 
 if __name__ == "__main__":
     unittest.main()
