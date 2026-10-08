@@ -1,5 +1,7 @@
+import asyncio
+from concurrent.futures import Executor
 from io import BufferedIOBase
-from typing import Sequence, Union
+from typing import Optional, Sequence, Union
 
 from pyrage import passphrase, plugin, ssh, tag, tagpq, x25519
 from pyrage.plugin import IdentityPluginV1, RecipientPluginV1
@@ -25,9 +27,13 @@ __all__ = (
     "encrypt",
     "encrypt_file",
     "encrypt_io",
+    "encrypt_async",
+    "encrypt_file_async",
     "decrypt",
     "decrypt_file",
     "decrypt_io",
+    "decrypt_async",
+    "decrypt_file_async",
     "RecipientError",
     "IdentityError",
     "EncryptError",
@@ -63,3 +69,31 @@ def decrypt_file(
 def decrypt_io(
     reader: BufferedIOBase, writer: BufferedIOBase, identities: Sequence[_Identity]
 ) -> None: ...
+def encrypt_async(
+    plaintext: bytes,
+    recipients: Sequence[_Recipient],
+    armored: bool = False,
+    *,
+    executor: Optional[Executor] = None,
+) -> asyncio.Future[bytes]: ...
+def encrypt_file_async(
+    infile: str,
+    outfile: str,
+    recipients: Sequence[_Recipient],
+    armored: bool = False,
+    *,
+    executor: Optional[Executor] = None,
+) -> asyncio.Future[None]: ...
+def decrypt_async(
+    ciphertext: bytes,
+    identities: Sequence[_Identity],
+    *,
+    executor: Optional[Executor] = None,
+) -> asyncio.Future[bytes]: ...
+def decrypt_file_async(
+    infile: str,
+    outfile: str,
+    identities: Sequence[_Identity],
+    *,
+    executor: Optional[Executor] = None,
+) -> asyncio.Future[None]: ...

@@ -12,9 +12,10 @@ use age_core::format::{FileKey, Stanza};
 use pyo3::{
     create_exception,
     exceptions::{PyException, PyTypeError},
+    impl_::extract_argument::argument_extraction_error,
     prelude::*,
     py_run,
-    types::PyBytes,
+    types::{PyBool, PyBytes, PyCFunction, PyTuple},
     Borrowed,
 };
 use pyo3_file::PyFileLikeObject;
@@ -390,6 +391,166 @@ fn decrypt_io(
     })
 }
 
+// Checks that `arg` converts to `T`, failing with the same error pyo3 raises
+// when extracting a typed argument, so `*_async` type errors are
+// indistinguishable from the sync API's.
+//
+// `argument_extraction_error` lives in pyo3's `impl_` module, which pyo3
+// may change without a semver bump; a pyo3 upgrade that breaks it fails to
+// compile, and `test_type_errors_match_sync` catches any drift in behavior.
+fn validate_arg<'a, 'py, T>(arg: &'a Bound<'py, PyAny>, name: &str) -> PyResult<()>
+where
+    T: FromPyObject<'a, 'py>,
+{
+    arg.extract::<T>()
+        .map(drop)
+        .map_err(|e| argument_extraction_error(arg.py(), name, e.into()))
+}
+
+// Like `validate_arg` for a sequence argument, but also returns a tuple
+// snapshot of it to hand to the executor: otherwise the caller could mutate
+// the (validated) list before the worker gets to it.
+fn validate_seq<'py, T>(arg: &Bound<'py, PyAny>, name: &str) -> PyResult<Bound<'py, PyAny>>
+where
+    for<'a> T: FromPyObject<'a, 'py>,
+{
+    validate_arg::<Vec<T>>(arg, name)?;
+    let items = arg.extract::<Vec<Bound<'py, PyAny>>>()?;
+    Ok(PyTuple::new(arg.py(), items)?.into_any())
+}
+
+// Schedules a synchronous pyrage function on the running event loop's
+// executor (its default one unless `executor` is given) and returns the
+// resulting `asyncio.Future`.
+//
+// Since the synchronous APIs release the GIL, this gives real concurrency
+// with other Python threads and with the event loop itself.
+//
+// The `*_async` functions below take their arguments as `PyAny` (they have
+// to hand Python objects to the executor), so each one validates them up
+// front: type errors surface at the call site, like the sync API, rather
+// than when the future is awaited.
+fn run_in_executor<'p>(
+    py: Python<'p>,
+    func: Bound<'p, PyCFunction>,
+    executor: Option<Bound<'p, PyAny>>,
+    args: Vec<Bound<'p, PyAny>>,
+) -> PyResult<Bound<'p, PyAny>> {
+    // The executor must run work on threads of this interpreter: neither the
+    // function nor the recipients/identities can be pickled for a process
+    // pool, and pyo3 modules can't be loaded in subinterpreters. Reject those
+    // here rather than with an obscure error on `await`.
+    if let Some(executor) = &executor {
+        let futures = py.import("concurrent.futures")?;
+        for name in ["ProcessPoolExecutor", "InterpreterPoolExecutor"] {
+            // `InterpreterPoolExecutor` is new in Python 3.14.
+            if let Some(cls) = futures.getattr_opt(name)? {
+                if executor.is_instance(&cls)? {
+                    return Err(PyTypeError::new_err(format!(
+                        "{name} is not supported; executor must be thread-based"
+                    )));
+                }
+            }
+        }
+    }
+
+    let event_loop = py.import("asyncio")?.call_method0("get_running_loop")?;
+
+    // Like `asyncio.to_thread`, run in a copy of the caller's context so
+    // that context variables (e.g. read by plugin callbacks) carry over.
+    let context = py.import("contextvars")?.call_method0("copy_context")?;
+
+    let executor = executor.unwrap_or_else(|| py.None().into_bound(py));
+    let mut call_args = vec![executor, context.getattr("run")?, func.into_any()];
+    call_args.extend(args);
+
+    event_loop.call_method1("run_in_executor", PyTuple::new(py, call_args)?)
+}
+
+#[pyfunction]
+#[pyo3(signature = (plaintext, recipients, armored=false, *, executor=None))]
+fn encrypt_async<'p>(
+    py: Python<'p>,
+    plaintext: Bound<'p, PyAny>,
+    recipients: Bound<'p, PyAny>,
+    armored: bool,
+    executor: Option<Bound<'p, PyAny>>,
+) -> PyResult<Bound<'p, PyAny>> {
+    validate_arg::<&[u8]>(&plaintext, "plaintext")?;
+    let recipients = validate_seq::<Box<dyn PyrageRecipient>>(&recipients, "recipients")?;
+
+    let armored = PyBool::new(py, armored).to_owned().into_any();
+    run_in_executor(
+        py,
+        wrap_pyfunction!(encrypt, py)?,
+        executor,
+        vec![plaintext, recipients, armored],
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (infile, outfile, recipients, armored=false, *, executor=None))]
+fn encrypt_file_async<'p>(
+    py: Python<'p>,
+    infile: Bound<'p, PyAny>,
+    outfile: Bound<'p, PyAny>,
+    recipients: Bound<'p, PyAny>,
+    armored: bool,
+    executor: Option<Bound<'p, PyAny>>,
+) -> PyResult<Bound<'p, PyAny>> {
+    validate_arg::<String>(&infile, "infile")?;
+    validate_arg::<String>(&outfile, "outfile")?;
+    let recipients = validate_seq::<Box<dyn PyrageRecipient>>(&recipients, "recipients")?;
+
+    let armored = PyBool::new(py, armored).to_owned().into_any();
+    run_in_executor(
+        py,
+        wrap_pyfunction!(encrypt_file, py)?,
+        executor,
+        vec![infile, outfile, recipients, armored],
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (ciphertext, identities, *, executor=None))]
+fn decrypt_async<'p>(
+    py: Python<'p>,
+    ciphertext: Bound<'p, PyAny>,
+    identities: Bound<'p, PyAny>,
+    executor: Option<Bound<'p, PyAny>>,
+) -> PyResult<Bound<'p, PyAny>> {
+    validate_arg::<&[u8]>(&ciphertext, "ciphertext")?;
+    let identities = validate_seq::<Box<dyn PyrageIdentity>>(&identities, "identities")?;
+
+    run_in_executor(
+        py,
+        wrap_pyfunction!(decrypt, py)?,
+        executor,
+        vec![ciphertext, identities],
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (infile, outfile, identities, *, executor=None))]
+fn decrypt_file_async<'p>(
+    py: Python<'p>,
+    infile: Bound<'p, PyAny>,
+    outfile: Bound<'p, PyAny>,
+    identities: Bound<'p, PyAny>,
+    executor: Option<Bound<'p, PyAny>>,
+) -> PyResult<Bound<'p, PyAny>> {
+    validate_arg::<String>(&infile, "infile")?;
+    validate_arg::<String>(&outfile, "outfile")?;
+    let identities = validate_seq::<Box<dyn PyrageIdentity>>(&identities, "identities")?;
+
+    run_in_executor(
+        py,
+        wrap_pyfunction!(decrypt_file, py)?,
+        executor,
+        vec![infile, outfile, identities],
+    )
+}
+
 #[pymodule]
 fn pyrage(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // HACK(ww): pyO3 modules are not packages, so we need this nasty
@@ -438,10 +599,14 @@ fn pyrage(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(encrypt))?;
     m.add_wrapped(wrap_pyfunction!(encrypt_file))?;
     m.add_wrapped(wrap_pyfunction!(encrypt_io))?;
+    m.add_wrapped(wrap_pyfunction!(encrypt_async))?;
+    m.add_wrapped(wrap_pyfunction!(encrypt_file_async))?;
     m.add("DecryptError", py.get_type::<DecryptError>())?;
     m.add_wrapped(wrap_pyfunction!(decrypt))?;
     m.add_wrapped(wrap_pyfunction!(decrypt_file))?;
     m.add_wrapped(wrap_pyfunction!(decrypt_io))?;
+    m.add_wrapped(wrap_pyfunction!(decrypt_async))?;
+    m.add_wrapped(wrap_pyfunction!(decrypt_file_async))?;
 
     Ok(())
 }

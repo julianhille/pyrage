@@ -88,6 +88,22 @@ from pyrage import encrypt, decrypt
 encrypted = await asyncio.to_thread(encrypt, b"...", [carol])
 ```
 
+The `*_async` variants do that for you on the running event loop's default
+executor (or a thread-based one you pass as `executor=`; process and
+interpreter pools are rejected) and return an awaitable. Like
+`asyncio.to_thread`, they run in a copy of the caller's `contextvars` context:
+
+```python
+from pyrage import encrypt_async, decrypt_async
+
+encrypted = await encrypt_async(b"...", [carol])
+decrypted = await decrypt_async(encrypted, [alice])
+```
+
+Arguments are validated up front, so a `TypeError` is raised at the call
+rather than on `await`. Cancelling the awaitable does not stop work that has
+already started.
+
 ## Development
 
 ```console

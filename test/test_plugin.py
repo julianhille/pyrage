@@ -1,3 +1,5 @@
+import asyncio
+import contextvars
 import os
 import stat
 import sys
@@ -103,6 +105,44 @@ class TestPluginRoundtrip(unittest.TestCase):
                 self.assertEqual(b"test", decrypted.read())
 
         self.assertEqual(2, len(callbacks.messages))
+
+    def test_roundtrip_async(self):
+        async def roundtrip():
+            callbacks = Callbacks()
+            encrypted = await pyrage.encrypt_async(
+                b"test", [self._recipient(callbacks)]
+            )
+            decrypted = await pyrage.decrypt_async(
+                encrypted, [self._identity(callbacks)]
+            )
+            return decrypted, callbacks.messages
+
+        decrypted, messages = asyncio.run(roundtrip())
+        self.assertEqual(b"test", decrypted)
+        self.assertEqual(2, len(messages))
+
+    def test_async_copies_context(self):
+        """
+        Like `asyncio.to_thread`, the `*_async` functions run in a copy of the
+        caller's context, so callbacks see the caller's context variables.
+        """
+        var = contextvars.ContextVar("var", default="unset")
+        seen = []
+
+        class ContextCallbacks(Callbacks):
+            def display_message(self, message):
+                seen.append(var.get())
+
+        async def roundtrip():
+            var.set("set")
+            callbacks = ContextCallbacks()
+            encrypted = await pyrage.encrypt_async(
+                b"test", [self._recipient(callbacks)]
+            )
+            await pyrage.decrypt_async(encrypted, [self._identity(callbacks)])
+
+        asyncio.run(roundtrip())
+        self.assertEqual(["set", "set"], seen)
 
     def test_missing_plugin(self):
         with self.assertRaises(pyrage.EncryptError):
