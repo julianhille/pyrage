@@ -512,6 +512,29 @@ fn encrypt_file_async<'p>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (reader, writer, recipients, armored=false, *, executor=None))]
+fn encrypt_io_async<'p>(
+    py: Python<'p>,
+    reader: Bound<'p, PyAny>,
+    writer: Bound<'p, PyAny>,
+    recipients: Bound<'p, PyAny>,
+    armored: bool,
+    executor: Option<Bound<'p, PyAny>>,
+) -> PyResult<Bound<'p, PyAny>> {
+    let recipients = validate_seq::<Box<dyn PyrageRecipient>>(&recipients, "recipients")?;
+    from_pyobject(reader.clone().unbind(), true)?;
+    from_pyobject(writer.clone().unbind(), false)?;
+
+    let armored = PyBool::new(py, armored).to_owned().into_any();
+    run_in_executor(
+        py,
+        wrap_pyfunction!(encrypt_io, py)?,
+        executor,
+        vec![reader, writer, recipients, armored],
+    )
+}
+
+#[pyfunction]
 #[pyo3(signature = (ciphertext, identities, *, executor=None))]
 fn decrypt_async<'p>(
     py: Python<'p>,
@@ -548,6 +571,27 @@ fn decrypt_file_async<'p>(
         wrap_pyfunction!(decrypt_file, py)?,
         executor,
         vec![infile, outfile, identities],
+    )
+}
+
+#[pyfunction]
+#[pyo3(signature = (reader, writer, identities, *, executor=None))]
+fn decrypt_io_async<'p>(
+    py: Python<'p>,
+    reader: Bound<'p, PyAny>,
+    writer: Bound<'p, PyAny>,
+    identities: Bound<'p, PyAny>,
+    executor: Option<Bound<'p, PyAny>>,
+) -> PyResult<Bound<'p, PyAny>> {
+    let identities = validate_seq::<Box<dyn PyrageIdentity>>(&identities, "identities")?;
+    from_pyobject(reader.clone().unbind(), true)?;
+    from_pyobject(writer.clone().unbind(), false)?;
+
+    run_in_executor(
+        py,
+        wrap_pyfunction!(decrypt_io, py)?,
+        executor,
+        vec![reader, writer, identities],
     )
 }
 
@@ -601,12 +645,14 @@ fn pyrage(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(encrypt_io))?;
     m.add_wrapped(wrap_pyfunction!(encrypt_async))?;
     m.add_wrapped(wrap_pyfunction!(encrypt_file_async))?;
+    m.add_wrapped(wrap_pyfunction!(encrypt_io_async))?;
     m.add("DecryptError", py.get_type::<DecryptError>())?;
     m.add_wrapped(wrap_pyfunction!(decrypt))?;
     m.add_wrapped(wrap_pyfunction!(decrypt_file))?;
     m.add_wrapped(wrap_pyfunction!(decrypt_io))?;
     m.add_wrapped(wrap_pyfunction!(decrypt_async))?;
     m.add_wrapped(wrap_pyfunction!(decrypt_file_async))?;
+    m.add_wrapped(wrap_pyfunction!(decrypt_io_async))?;
 
     Ok(())
 }

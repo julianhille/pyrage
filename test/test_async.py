@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from io import BytesIO
 
 from parameterized import parameterized
 
@@ -84,6 +85,10 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
                 lambda: pyrage.encrypt_file_async(1, path, [recipient]),  # ty: ignore[invalid-argument-type]
                 lambda: pyrage.decrypt_file_async(path, path, bad),  # ty: ignore[invalid-argument-type]
                 lambda: pyrage.decrypt_file_async(path, 1, [identity]),  # ty: ignore[invalid-argument-type]
+                lambda: pyrage.encrypt_io_async(BytesIO(), BytesIO(), bad),  # ty: ignore[invalid-argument-type]
+                lambda: pyrage.encrypt_io_async("str", BytesIO(), [recipient]),  # ty: ignore[invalid-argument-type]
+                lambda: pyrage.decrypt_io_async(BytesIO(), BytesIO(), bad),  # ty: ignore[invalid-argument-type]
+                lambda: pyrage.decrypt_io_async(BytesIO(), "str", [identity]),  # ty: ignore[invalid-argument-type]
             ]
             for call in calls:
                 with self.assertRaises(TypeError):
@@ -116,6 +121,9 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
             (pyrage.encrypt_file, pyrage.encrypt_file_async, (1, "o", [recipient])),
             (pyrage.encrypt_file, pyrage.encrypt_file_async, ("i", "o", bad)),
             (pyrage.decrypt_file, pyrage.decrypt_file_async, ("i", 1, [identity])),
+            (pyrage.encrypt_io, pyrage.encrypt_io_async, ("x", BytesIO(), [recipient])),
+            (pyrage.encrypt_io, pyrage.encrypt_io_async, (BytesIO(), BytesIO(), bad)),
+            (pyrage.decrypt_io, pyrage.decrypt_io_async, (BytesIO(), "x", [identity])),
         ]
         for sync, async_, args in pairs:
             with self.subTest(fn=async_.__name__, args=args):
@@ -147,6 +155,22 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
             gate.set()
 
             self.assertEqual(b"test", await decrypted)
+
+    @parameterized.expand([(False,), (True,)])
+    async def test_roundtrip_io(self, armored):
+        identity = pyrage.x25519.Identity.generate()
+        recipient = identity.to_public()
+
+        encrypted = BytesIO()
+        await pyrage.encrypt_io_async(
+            BytesIO(b"test"), encrypted, [recipient], armored=armored
+        )
+        encrypted.seek(0)
+
+        decrypted = BytesIO()
+        await pyrage.decrypt_io_async(encrypted, decrypted, [identity])
+
+        self.assertEqual(b"test", decrypted.getvalue())
 
     async def test_custom_executor(self):
         identity = pyrage.x25519.Identity.generate()

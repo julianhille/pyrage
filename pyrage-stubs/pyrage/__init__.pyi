@@ -29,11 +29,13 @@ __all__ = (
     "encrypt_io",
     "encrypt_async",
     "encrypt_file_async",
+    "encrypt_io_async",
     "decrypt",
     "decrypt_file",
     "decrypt_io",
     "decrypt_async",
     "decrypt_file_async",
+    "decrypt_io_async",
     "RecipientError",
     "IdentityError",
     "EncryptError",
@@ -93,6 +95,21 @@ def decrypt_async(
 def decrypt_file_async(
     infile: str,
     outfile: str,
+    identities: Sequence[_Identity],
+    *,
+    executor: Optional[Executor] = None,
+) -> asyncio.Future[None]: ...
+def encrypt_io_async(
+    reader: BufferedIOBase,
+    writer: BufferedIOBase,
+    recipients: Sequence[_Recipient],
+    armored: bool = False,
+    *,
+    executor: Optional[Executor] = None,
+) -> asyncio.Future[None]: ...
+def decrypt_io_async(
+    reader: BufferedIOBase,
+    writer: BufferedIOBase,
     identities: Sequence[_Identity],
     *,
     executor: Optional[Executor] = None,
