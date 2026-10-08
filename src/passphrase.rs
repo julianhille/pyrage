@@ -24,14 +24,24 @@ fn encrypt<'p>(
     Ok(PyBytes::new(py, &encrypted))
 }
 
+// `max_work_factor` caps the scrypt work factor (`log2(N)`) `decrypt`
+// accepts. By default age derives the cap from a timing benchmark (four
+// above what takes ~1s here) and rejects anything more expensive; that
+// benchmark can come out low on a busy machine, so callers may pass a fixed
+// cap instead.
 #[pyfunction]
+#[pyo3(signature = (ciphertext, passphrase, max_work_factor=None))]
 fn decrypt<'p>(
     py: Python<'p>,
     ciphertext: &[u8],
     passphrase: &str,
+    max_work_factor: Option<u8>,
 ) -> PyResult<Bound<'p, PyBytes>> {
     let decrypted = py.detach(|| {
-        let identity = scrypt::Identity::new(passphrase.into());
+        let mut identity = scrypt::Identity::new(passphrase.into());
+        if let Some(max_work_factor) = max_work_factor {
+            identity.set_max_work_factor(max_work_factor);
+        }
         let mut decrypted = vec![];
         decrypt_stream(ciphertext, &mut decrypted, iter::once(&identity as _))?;
         PyResult::Ok(decrypted)
