@@ -51,15 +51,15 @@ def encrypt_file(
     armored: bool = False,
 ) -> None: ...
 def encrypt_io(
-    in_io: BufferedIOBase,
-    out_io: BufferedIOBase,
+    reader: BufferedIOBase,
+    writer: BufferedIOBase,
     recipients: Sequence[_Recipient],
     armored: bool = False,
-) -> bytes: ...
+) -> None: ...
 def decrypt(ciphertext: bytes, identities: Sequence[_Identity]) -> bytes: ...
 def decrypt_file(
     infile: str, outfile: str, identities: Sequence[_Identity]
 ) -> None: ...
 def decrypt_io(
-    in_io: BufferedIOBase, out_io: BufferedIOBase, identities: Sequence[_Identity]
+    reader: BufferedIOBase, writer: BufferedIOBase, identities: Sequence[_Identity]
 ) -> None: ...
