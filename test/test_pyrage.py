@@ -55,6 +55,71 @@ class TestPyrage(unittest.TestCase):
         unencrypted.seek(0)
         self.assertEqual(unencrypted.read(), decrypted.read())
 
+    @parameterized.expand([(False, 1), (True, 1), (False, 4), (True, 4)])
+    def test_roundtrip_io_buffer_blocks(self, armored, buffer_blocks):
+        identity = pyrage.x25519.Identity.generate()
+        recipient = identity.to_public()
+        # Spans several buffers and ends mid-chunk.
+        plaintext = os.urandom(5 * pyrage.DEFAULT_PYRAGE_BLOCKSIZE + 123)
+        encrypted = BytesIO()
+        decrypted = BytesIO()
+        pyrage.encrypt_io(
+            BytesIO(plaintext),
+            encrypted,
+            [recipient],
+            armored=armored,
+            buffer_blocks=buffer_blocks,
+        )
+        encrypted.seek(0)
+        pyrage.decrypt_io(encrypted, decrypted, [identity], buffer_blocks=buffer_blocks)
+        self.assertEqual(plaintext, decrypted.getvalue())
+
+    @parameterized.expand([(0,), (-1,), (1025,)])
+    def test_io_buffer_blocks_invalid(self, buffer_blocks):
+        identity = pyrage.x25519.Identity.generate()
+        recipient = identity.to_public()
+
+        with self.assertRaisesRegex(ValueError, "buffer_blocks must be between"):
+            pyrage.encrypt_io(
+                BytesIO(b"test"), BytesIO(), [recipient], buffer_blocks=buffer_blocks
+            )
+
+        with self.assertRaisesRegex(ValueError, "buffer_blocks must be between"):
+            pyrage.decrypt_io(
+                BytesIO(b"test"), BytesIO(), [identity], buffer_blocks=buffer_blocks
+            )
+
+    @parameterized.expand([(1,), (2,), (4,)])
+    def test_encrypt_io_writes_whole_encrypted_chunks(self, buffer_blocks):
+        class RecordingWriter(BytesIO):
+            def __init__(self):
+                super().__init__()
+                self.sizes = []
+
+            def write(self, data):
+                self.sizes.append(len(data))
+                return super().write(data)
+
+        recipient = pyrage.x25519.Identity.generate().to_public()
+        chunks = 4 * buffer_blocks + 1
+        writer = RecordingWriter()
+        pyrage.encrypt_io(
+            BytesIO(os.urandom(chunks * pyrage.DEFAULT_PYRAGE_BLOCKSIZE)),
+            writer,
+            [recipient],
+            buffer_blocks=buffer_blocks,
+        )
+        # Each 64 KiB chunk gains a 16-byte tag. Between the first write
+        # (which carries the header) and the final flush, every write is
+        # exactly `buffer_blocks` whole encrypted chunks.
+        encrypted_chunk = pyrage.DEFAULT_PYRAGE_BLOCKSIZE + 16
+        for size in writer.sizes[1:-1]:
+            self.assertEqual(size, buffer_blocks * encrypted_chunk)
+
+    def test_io_buffer_constants(self):
+        self.assertEqual(pyrage.DEFAULT_PYRAGE_BLOCKSIZE, 64 * 1024)
+        self.assertEqual(pyrage.MAX_BUFFER_BLOCKS, 1024)
+
     def test_roundtrip_io_fail(self):
         identity = pyrage.x25519.Identity.generate()
         recipient = identity.to_public()

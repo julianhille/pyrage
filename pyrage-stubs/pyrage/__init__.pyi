@@ -16,6 +16,8 @@ _Recipient = Union[
 ]
 
 __all__ = (
+    "DEFAULT_PYRAGE_BLOCKSIZE",
+    "MAX_BUFFER_BLOCKS",
     "ssh",
     "tag",
     "tagpq",
@@ -33,6 +35,9 @@ __all__ = (
     "EncryptError",
     "DecryptError",
 )
+
+DEFAULT_PYRAGE_BLOCKSIZE: int
+MAX_BUFFER_BLOCKS: int
 
 class RecipientError(Exception): ...
 class IdentityError(Exception): ...
@@ -55,11 +60,17 @@ def encrypt_io(
     out_io: BufferedIOBase,
     recipients: Sequence[_Recipient],
     armored: bool = False,
-) -> bytes: ...
+    *,
+    buffer_blocks: int = 1,
+) -> None: ...
 def decrypt(ciphertext: bytes, identities: Sequence[_Identity]) -> bytes: ...
 def decrypt_file(
     infile: str, outfile: str, identities: Sequence[_Identity]
 ) -> None: ...
 def decrypt_io(
-    in_io: BufferedIOBase, out_io: BufferedIOBase, identities: Sequence[_Identity]
+    in_io: BufferedIOBase,
+    out_io: BufferedIOBase,
+    identities: Sequence[_Identity],
+    *,
+    buffer_blocks: int = 1,
 ) -> None: ...
