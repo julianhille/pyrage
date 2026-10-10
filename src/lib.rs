@@ -11,7 +11,7 @@ use age::{
 use age_core::format::{FileKey, Stanza};
 use pyo3::{
     create_exception,
-    exceptions::{PyException, PyTypeError},
+    exceptions::{PyException, PyTypeError, PyValueError},
     prelude::*,
     py_run,
     types::PyBytes,
@@ -310,6 +310,29 @@ fn decrypt_file(
     })
 }
 
+// age's STREAM chunk size: plaintext is encrypted in chunks of this many bytes.
+const DEFAULT_PYRAGE_BLOCKSIZE: usize = 64 * 1024;
+
+// Each encrypted chunk carries a 16-byte Poly1305 tag, so binary ciphertext
+// comes out in chunks of this many bytes.
+const ENCRYPTED_BLOCKSIZE: usize = DEFAULT_PYRAGE_BLOCKSIZE + 16;
+
+// Caps each `_io` buffer at 64 MiB. A failed allocation aborts the process
+// instead of raising, so callers can't ask for arbitrarily large buffers.
+const MAX_BUFFER_BLOCKS: i64 = 1024;
+
+// Each buffer fill/flush re-acquires the GIL, so larger buffers mean fewer
+// round-trips. Buffers hold `buffer_blocks` whole age chunks; this validates
+// the count.
+fn buffer_blocks(buffer_blocks: i64) -> PyResult<usize> {
+    if !(1..=MAX_BUFFER_BLOCKS).contains(&buffer_blocks) {
+        return Err(PyValueError::new_err(format!(
+            "buffer_blocks must be between 1 and {MAX_BUFFER_BLOCKS}, got {buffer_blocks}"
+        )));
+    }
+    Ok(buffer_blocks as usize)
+}
+
 fn from_pyobject(file: Py<PyAny>, read_only: bool) -> PyResult<PyFileLikeObject> {
     // is a file-like
     PyFileLikeObject::with_requirements(file, read_only, !read_only, false, false)
@@ -318,20 +341,27 @@ fn from_pyobject(file: Py<PyAny>, read_only: bool) -> PyResult<PyFileLikeObject>
 // NOTE: `PyFileLikeObject` re-acquires the GIL for each read/write, so the
 // crypto work in the `_io` variants still runs with the GIL released.
 #[pyfunction]
-#[pyo3(signature = (reader, writer, recipients, armored=false))]
+#[pyo3(signature = (reader, writer, recipients, armored=false, *, buffer_blocks=1))]
 fn encrypt_io(
     py: Python<'_>,
     reader: Py<PyAny>,
     writer: Py<PyAny>,
     recipients: Vec<Box<dyn PyrageRecipient>>,
     armored: bool,
+    buffer_blocks: i64,
 ) -> PyResult<()> {
+    let blocks = self::buffer_blocks(buffer_blocks)?;
+    let read_capacity = blocks * DEFAULT_PYRAGE_BLOCKSIZE;
+    // Size the output buffer in encrypted chunks: with plain 64 KiB blocks a
+    // buffer of N blocks only fits N-1 encrypted chunks and flushes early.
+    // (Armored output arrives in short lines and fills any size evenly.)
+    let write_capacity = blocks * ENCRYPTED_BLOCKSIZE;
     // The file-likes are created (and dropped) while holding the GIL; only
     // borrows of them cross into the detached section.
     let reader = from_pyobject(reader, true)?;
     let writer = from_pyobject(writer, false)?;
-    let mut reader = std::io::BufReader::new(reader);
-    let mut writer = std::io::BufWriter::new(writer);
+    let mut reader = std::io::BufReader::with_capacity(read_capacity, reader);
+    let mut writer = std::io::BufWriter::with_capacity(write_capacity, writer);
 
     py.detach(|| {
         // This turns each `dyn PyrageRecipient` into a `dyn Recipient`, which
@@ -367,17 +397,22 @@ fn encrypt_io(
 }
 
 #[pyfunction]
+#[pyo3(signature = (reader, writer, identities, *, buffer_blocks=1))]
 fn decrypt_io(
     py: Python<'_>,
     reader: Py<PyAny>,
     writer: Py<PyAny>,
     identities: Vec<Box<dyn PyrageIdentity>>,
+    buffer_blocks: i64,
 ) -> PyResult<()> {
+    // Ciphertext isn't chunk-aligned on input, but `BufReader` streams it: each
+    // refill is one full buffer regardless of where chunks start.
+    let capacity = self::buffer_blocks(buffer_blocks)? * DEFAULT_PYRAGE_BLOCKSIZE;
     // See `encrypt_io`: the file-likes never get dropped without the GIL.
     let reader = from_pyobject(reader, true)?;
     let writer = from_pyobject(writer, false)?;
-    let mut reader = std::io::BufReader::new(reader);
-    let mut writer = std::io::BufWriter::new(writer);
+    let mut reader = std::io::BufReader::with_capacity(capacity, reader);
+    let mut writer = std::io::BufWriter::with_capacity(capacity, writer);
     py.detach(|| {
         // Move the identities in (they're only `Send`); the file-likes stay
         // borrowed so they are dropped with the GIL held.
@@ -435,6 +470,9 @@ fn pyrage(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add("IdentityError", py.get_type::<IdentityError>())?;
     m.add("RecipientError", py.get_type::<RecipientError>())?;
+
+    m.add("DEFAULT_PYRAGE_BLOCKSIZE", DEFAULT_PYRAGE_BLOCKSIZE)?;
+    m.add("MAX_BUFFER_BLOCKS", MAX_BUFFER_BLOCKS)?;
 
     m.add("EncryptError", py.get_type::<EncryptError>())?;
     m.add_wrapped(wrap_pyfunction!(encrypt))?;
