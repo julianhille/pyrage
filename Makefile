@@ -27,3 +27,13 @@ dist-pyrage:
 .PHONY: dist-pyrage-stubs
 dist-pyrage-stubs:
 	$(UV) build ./pyrage-stubs --out-dir dist
+
+BENCH = $(UV) run --locked --with uvloop python bench/bench_io.py
+
+.PHONY: bench-data
+bench-data: develop
+	$(BENCH) prepare
+
+.PHONY: bench
+bench: bench-data
+	$(BENCH) run $(BENCH_ARGS)
