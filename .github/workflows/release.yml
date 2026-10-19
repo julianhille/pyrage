@@ -92,16 +92,11 @@ jobs:
           name: pyrage-dists-windows
           path: dist/
 
-  pypi-publish:
-    name: publish all dists to PyPI
+  github-release:
+    name: attach all dists to the GitHub release
     runs-on: ubuntu-latest
-    environment: release
     permissions:
-      # Used for OIDC publishing.
-      # Used to sign the release's artifacts with sigstore-python.
-      id-token: write
-
-      # Used to attach signing artifacts to the published release.
+      # Used to attach the dists to the published release.
       contents: write
     needs:
       - release-linux
@@ -117,5 +112,8 @@ jobs:
           path: dist/
           merge-multiple: true
 
-      - name: publish
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      - name: upload dists to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"
